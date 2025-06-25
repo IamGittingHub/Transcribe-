@@ -451,17 +451,25 @@
                         <option value="low">Low (16kHz, 64kbps)</option>
                     </select>
                 </div>
+                <div class="config-group">
+                    <label for="speaker-count">Number of Speakers</label>
+                    <input type="number" id="speaker-count" min="1" value="2" />
+                </div>
+                <div class="config-group">
+                    <label for="speaker-names">Speaker Names (comma separated)</label>
+                    <input type="text" id="speaker-names" placeholder="Alice,Bob" />
+                </div>
             </div>
         </div>
 
         <!-- File Upload -->
         <div class="upload-section">
-            <h3 style="margin-bottom: 20px;">📁 Upload Video File</h3>
+            <h3 style="margin-bottom: 20px;">📁 Upload Media File</h3>
             <div class="upload-area" id="upload-area">
                 <div class="upload-icon">🎥</div>
                 <h4>Click to upload or drag and drop</h4>
-                <p>Supports MP4, WebM, AVI, MOV (Max 500MB)</p>
-                <input type="file" id="video-input" accept="video/*" style="display: none;" />
+                <p>Supports most audio and video formats</p>
+                <input type="file" id="video-input" accept="video/*,audio/*" style="display: none;" />
             </div>
             <div class="file-info" id="file-info"></div>
         </div>
@@ -551,6 +559,7 @@
                 this.currentWordIndex = -1;
                 this.playOnClick = true;
                 this.autoScroll = true;
+                this.ffmpegLoaded = false;
                 
                 this.initializeElements();
                 this.setupEventListeners();
@@ -570,6 +579,8 @@
                 this.speakerDiarization = document.getElementById('speaker-diarization');
                 this.wordTimestamps = document.getElementById('word-timestamps');
                 this.audioQuality = document.getElementById('audio-quality');
+                this.speakerCount = document.getElementById('speaker-count');
+                this.speakerNames = document.getElementById('speaker-names');
                 
                 // Processing elements
                 this.processingSection = document.getElementById('processing-section');
@@ -675,16 +686,13 @@
             }
 
             validateFile(file) {
-                const allowedTypes = ['video/mp4', 'video/webm', 'video/avi', 'video/mov', 'video/quicktime'];
-                const maxSize = 500 * 1024 * 1024; // 500MB
+                const allowedTypes = [
+                    'video/mp4', 'video/webm', 'video/avi', 'video/mov', 'video/quicktime',
+                    'audio/mpeg', 'audio/wav', 'audio/mp3', 'audio/ogg', 'audio/x-wav'
+                ];
 
-                if (!allowedTypes.includes(file.type)) {
-                    this.showError('Please select a valid video file (MP4, WebM, AVI, MOV)');
-                    return false;
-                }
-
-                if (file.size > maxSize) {
-                    this.showError('File size too large. Please select a file under 500MB.');
+                if (!allowedTypes.includes(file.type) && !file.type.startsWith('audio/') && !file.type.startsWith('video/')) {
+                    this.showError('Please select a valid audio or video file');
                     return false;
                 }
 
@@ -704,6 +712,8 @@
 
             async startProcessing() {
                 if (!this.validateConfiguration()) return;
+
+                await this.loadFFmpeg();
 
                 this.processingSection.style.display = 'block';
                 this.currentStep = 'extract';
@@ -789,14 +799,17 @@
                 this.updateProgress(30, 'Sending audio for transcription...');
 
                 const service = this.transcriptionService.value;
-                
+
                 try {
+                    let result;
                     if (service === 'assemblayai') {
-                        await this.transcribeWithAssemblyAI();
+                        result = await this.transcribeWithAssemblyAI();
                     } else {
-                        await this.transcribeWithOpenAI();
+                        result = await this.transcribeWithOpenAI();
                     }
-                    
+
+                    this.transcriptData = result;
+
                     this.updateStep('step-transcribe', 'completed');
                     this.updateProgress(70, 'Transcription completed');
                     
@@ -848,9 +861,9 @@
                 }
                 
                 const { id } = await transcriptResponse.json();
-                
+
                 // Poll for completion
-                await this.pollAssemblyAIResult(id, apiKey);
+                return await this.pollAssemblyAIResult(id, apiKey);
             }
 
             async pollAssemblyAIResult(transcriptId, apiKey) {
@@ -871,8 +884,7 @@
                     const result = await response.json();
                     
                     if (result.status === 'completed') {
-                        this.transcriptData = this.formatAssemblyAIResult(result);
-                        return;
+                        return this.formatAssemblyAIResult(result);
                     } else if (result.status === 'error') {
                         throw new Error(`Transcription failed: ${result.error}`);
                     }
@@ -939,6 +951,9 @@
                 formData.append('model', 'gpt-4o-transcribe');
                 formData.append('response_format', 'verbose_json');
                 formData.append('timestamp_granularities[]', 'word');
+                if (this.speakerDiarization.value === 'true') {
+                    formData.append('speaker_labels', 'true');
+                }
                 if (language) formData.append('language', language);
                 
                 const response = await fetch('https://api.openai.com/v1/audio/transcriptions', {
@@ -955,13 +970,31 @@
                 }
                 
                 const result = await response.json();
-                this.transcriptData = this.formatOpenAIResult(result);
+                return this.formatOpenAIResult(result);
             }
 
             formatOpenAIResult(result) {
-                // Since OpenAI doesn't provide speaker diarization,  create a single speaker segment
+                if (result.segments) {
+                    const segments = result.segments.map(seg => ({
+                        speaker: `Speaker ${seg.speaker + 1}`,
+                        start: seg.start,
+                        end: seg.end,
+                        words: seg.words.map(w => ({
+                            text: w.word,
+                            start: w.start,
+                            end: w.end,
+                            confidence: w.confidence || 0.9
+                        }))
+                    }));
+                    return {
+                        text: result.text,
+                        segments,
+                        confidence: result.segments.reduce((a, s) => a + (s.confidence || 0.9), 0) / result.segments.length,
+                        language: result.language
+                    };
+                }
+
                 const words = result.words || [];
-                
                 return {
                     text: result.text,
                     segments: [{
@@ -972,7 +1005,7 @@
                             text: word.word,
                             start: word.start,
                             end: word.end,
-                            confidence: 0.9 // OpenAI doesn't provide word-level confidence
+                            confidence: 0.9
                         }))
                     }],
                     confidence: 0.9,
@@ -984,12 +1017,7 @@
                 this.updateStep('step-diarize', 'processing');
                 this.updateProgress(75, 'Processing speaker information...');
                 
-                // If using OpenAI and speaker diarization is enabled, 
-                // we could implement a post-processing step here
-                if (this.transcriptionService.value === 'openai' && this.speakerDiarization.value === 'true') {
-                    // For now, we'll just use the single speaker format
-                    // In a real implementation, you could integrate with pyannote-audio or similar
-                }
+                // Speaker information may already be included from the API
                 
                 this.updateStep('step-diarize', 'completed');
                 this.updateStep('step-format', 'processing');
@@ -998,6 +1026,8 @@
                 // Prepare audio player
                 const audioUrl = URL.createObjectURL(this.audioBlob);
                 this.audioPlayer.src = audioUrl;
+
+                this.applySpeakerNames();
                 
                 this.updateStep('step-format', 'completed');
                 this.updateProgress(100, 'Processing complete!');
@@ -1116,9 +1146,20 @@
                 const segment = editedLabel.closest('.speaker-segment');
                 const segmentIndex = parseInt(segment.dataset.segment);
                 const newSpeakerName = editedLabel.textContent.trim();
-                
+
                 // Update in data structure
                 this.transcriptData.segments[segmentIndex].speaker = newSpeakerName;
+            }
+
+            applySpeakerNames() {
+                const names = this.speakerNames.value.split(',').map(n => n.trim()).filter(Boolean);
+                this.transcriptData.segments.forEach(seg => {
+                    const match = seg.speaker.match(/(\d+)/);
+                    if (match) {
+                        const idx = parseInt(match[1]) - 1;
+                        if (names[idx]) seg.speaker = names[idx];
+                    }
+                });
             }
 
             togglePlayOnClick() {
